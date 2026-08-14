@@ -3378,6 +3378,8 @@ function solverWorkerMain(){
       }))
     }));
 
+
+
     function areAdjacent(a,b){ return (a.neighborMask & b.mask) !== 0n; }
     function statBonusEvent(kind, source, sourceName, target, targetName, neighbor, neighborName, rate, stat, base){
       const bonusAtk = stat === 'attack' ? base.attack*rate/100 : 0;
@@ -3882,7 +3884,7 @@ function solverWorkerMain(){
       }
       if(!bestLocal) return evaluateConcrete([]);
       const closeToBest = best.totalScore<0 || bestLocal.complete!==best.complete || bestLocal.totalScore>=best.totalScore-Math.max(1,Math.abs(best.totalScore)*0.015);
-      if(useBonus && (intensive || closeToBest)) bestLocal=improveConcreteAssignments(bestLocal.placements,intensive?28:8);
+      if(useBonus && (intensive || closeToBest)) bestLocal=improveConcreteAssignments(bestLocal.placements,intensive?40:12);
       if(cacheKey){
         if(singletonCompletionCache.size>=2000) singletonCompletionCache.delete(singletonCompletionCache.keys().next().value);
         singletonCompletionCache.set(cacheKey,bestLocal);
@@ -4219,13 +4221,14 @@ function solverWorkerMain(){
     // 前面所有局部改进都只在“同形状”物品之间交换/搬移，永远不会尝试“单格↔多格互换位置”这类动作，
     // 这正是用户观察到“换一下一格和两格就能更好”的系统性盲区。这里补上两类新动作，用真实评分决定是否接受：
     //  A. 单格物品搬移到任意空格（可能比任何两两交换都更优）；
-    //  B. 多格物品搬移到“压着若干单格物品”的合法位置，被压单格连同其余空格一起重新做贪心分配。
+    //  B. 多格物品搬移到任意合法位置（无论是否压着单格），被压单格连同其余空格一起重新做贪心分配；
+    //     纯空地搬移同样尝试——配合单格重排可能整体更优（v14 放宽了原来“必须压住单格”的限制）。
     function crossShapeImprove(seed, deadline, allowMultiRelocate){
       currentStage='阶段3：跨形状后处理（单格↔多格互换）';
       let current = seed.slice();
       let curEval = evaluateConcrete(current);
       accept(curEval);
-      const passLimit = allowMultiRelocate ? 5 : 3;
+      const passLimit = allowMultiRelocate ? 6 : 3;
       let executed = 0;
       for(let pass=0; pass<passLimit && performance.now()<deadline && nodes<nodeLimit; pass++){
         executed++;
@@ -4250,7 +4253,7 @@ function solverWorkerMain(){
           }
         }
         if(changed) continue;
-        // B. 多格搬移（允许压住单格；压住的单格连同全部单格重新分配）
+        // B. 多格搬移（v14：任意合法位置，无论是否压住单格；被影响的单格连同其余空格整体重分配）
         if(allowMultiRelocate){
           occupied = 0n; for(const p of current) occupied |= p.mask;
           const singMask = current.reduce((m,p)=>p.area===1?m|p.mask:m, 0n);
@@ -4264,7 +4267,6 @@ function solverWorkerMain(){
               nodes++;
               if(T.mask===m.mask) continue;
               if((T.mask & multiOtherMask)!==0n) continue;
-              if((T.mask & singMask)===0n) continue;
               const newMulti = baseMultis.concat(placementForItemAtMask(item, T.mask));
               const evc = completeGeometryWithSingletons(newMulti, false);
               if(compareEvaluationObjects(evc,curEval)>0){ curEval=evc; accept(curEval); current=evc.placements.slice(); changed=true; break; }
@@ -4358,8 +4360,8 @@ function solverWorkerMain(){
 
     if(fullPackingAttempted){
       groups=fullCoreGroups; geometryMode=true;
-      const stageDeadline=Math.min(hardDeadline,started+timeLimit*0.30);
-      const stageNodeCap=Math.min(nodeLimit,Math.max(1000,Math.floor(nodeLimit*0.30)));
+      const stageDeadline=Math.min(hardDeadline,started+timeLimit*0.25);
+      const stageNodeCap=Math.min(nodeLimit,Math.max(1000,Math.floor(nodeLimit*0.25)));
       fullPackingFound=findFullPacking(stageDeadline,stageNodeCap);
       if(fullPackingFound){
         accept(completeGeometryWithSingletons(fullSeed,true));
@@ -4368,10 +4370,15 @@ function solverWorkerMain(){
         fullSeed=localImprove(fullSeed,localDeadline);
         const multiDeadline=Math.min(hardDeadline,performance.now()+Math.max(500,Math.min(5000,timeLimit*0.22)));
         if(performance.now()<multiDeadline && nodes<nodeLimit) multiStartFullPackings(multiDeadline,Math.min(nodeLimit,nodes+Math.max(5000,Math.floor(nodeLimit*0.25))));
-        const crossReserve=Math.min(3000,Math.max(800,timeLimit*0.12));
+        const crossReserve=Math.min(4500,Math.max(1200,timeLimit*0.18));
         const optimizeDeadline=Math.max(performance.now(),hardDeadline-crossReserve);
         if(performance.now()<optimizeDeadline && nodes<nodeLimit) optimizeFullPackings(optimizeDeadline,nodeLimit);
-        if(best.complete && performance.now()<hardDeadline && nodes<nodeLimit) crossShapeImprove(best.placements,hardDeadline,true);
+        if(best.complete && performance.now()<hardDeadline && nodes<nodeLimit){
+          crossShapeImprove(best.placements,hardDeadline,true);
+          // v14：跨形状改动后回环——同形状局部优化 + 跨形状再一轮，让不同形状的联动重排有机会收敛
+          if(best.complete && performance.now()<hardDeadline && nodes<nodeLimit) localImprove(best.placements,hardDeadline);
+          if(best.complete && performance.now()<hardDeadline && nodes<nodeLimit) crossShapeImprove(best.placements,hardDeadline,true);
+        }
       }else if(performance.now()<hardDeadline && nodes<nodeLimit){
         groups=partialGroups; geometryMode=false;
         searchBestPartial(hardDeadline,nodeLimit);
