@@ -380,7 +380,7 @@
 
   <section>
     <div class="card result-card">
-      <h2>5. 自动搜索与当前最佳摆放结果 <span style="font-size:12px;color:#2563eb;font-weight:400">v15</span></h2>
+      <h2>5. 自动搜索与当前最佳摆放结果 <span style="font-size:12px;color:#2563eb;font-weight:400">v16</span></h2>
       <div class="output-wrap">
         <div class="result-main">
           <div class="result-grid-block">
@@ -414,10 +414,13 @@
             <div class="row">
               <button id="solveBtn" class="primary">搜索更优摆放解</button>
               <button id="cancelSolveBtn" class="danger" disabled>停止计算</button>
+              <button id="seedImportBtn" title="导入手动摆盘/求解结果 JSON 作为本次求解起点（好起点可直接进好盆地；坏起点不影响搜索结果）">导入摆法起点</button>
+              <input id="seedImportFile" type="file" accept=".json,application/json" hidden>
               <button id="exportBtn">导出结果 JSON</button>
               <button id="saveBtn">保存当前配置</button>
               <button id="loadBtn">读取配置</button>
             </div>
+            <div class="hint"><span id="seedHint">摆法起点：未设置。</span> 可导入手动摆盘工具导出的 JSON（或本页导出的结果 JSON）作为求解起点——求解器会先验证并载入这套摆法，再从它继续优化；摆法不完整或不合法的部分会自动跳过，坏起点不会让结果比不开起点更差。</div>
             <div class="hint">快速档优先在 3 秒内给出可用结果；深度档使用自定义上限继续优化。并行搜索会用多个不同随机起点同时计算并合并最佳结果，速度更快但会增加 CPU 与耗电，默认关闭。达到时间或节点上限不代表已证明全局最优。</div>
           </div>
         </div>
@@ -699,6 +702,7 @@ let solverWorker = null;
 let solverWorkers = [];
 let solverStatusTimer = null;
 let solverStatusState = null;
+let seedLayout = null; // 求解起点（种子摆法）：[{no, cells}]，求解时映射为 itemIndex
 const RECOGNITION_GRID_COLS = 7;
 const RECOGNITION_GRID_ROWS = 6;
 const RECOGNITION_QUALITY_PALETTE = {
@@ -960,6 +964,8 @@ function bindEvents(){
     document.getElementById('timeLimit').disabled=!deep;
   });
   document.getElementById('exportBtn').addEventListener('click', exportResult);
+  document.getElementById('seedImportBtn').addEventListener('click', ()=>document.getElementById('seedImportFile').click());
+  document.getElementById('seedImportFile').addEventListener('change', importSeedLayout);
   document.getElementById('saveBtn').addEventListener('click', saveConfig);
   document.getElementById('loadBtn').addEventListener('click', loadConfig);
   document.getElementById('useAdjacencyBonus').addEventListener('change', ()=>{
@@ -4415,6 +4421,28 @@ function solverWorkerMain(){
       rec(0n,0,0,0,0,0,0,0,0,0,0,0,emptyManualVector(),emptyDefaultVector(),initialRemArea,initialRemBase);
     }
 
+    // v16：求解起点（种子摆法）注入——人眼/手动摆法作为初始最优，坏种子不影响搜索（accept 只接受更优）
+    if(data.seedLayout && Array.isArray(data.seedLayout)){
+      const seeded = [];
+      for(const s of data.seedLayout){
+        const it = items[s.itemIndex];
+        if(!it) continue;
+        let mask = 0n;
+        for(const [r,c] of s.cells){ if(r<0||r>=H||c<0||c>=W) { mask = -1n; break; } mask |= bit(r,c); }
+        if(mask < 0n) continue;
+        const t = itemPlacementLookup[s.itemIndex].get(mask.toString());
+        if(!t) continue; // 该件在起点中的摆放不在合法集合内（如旋转方向不同）→ 跳过
+        const np = instantiate(t, it, fullGroupByUid.get(String(it.uid)) || null);
+        if((seeded.reduce((m,p)=>m|p.mask,0n) & np.mask) !== 0n) continue; // 重叠 → 跳过
+        seeded.push(np);
+      }
+      if(seeded.length){
+        const evc = evaluateConcrete(seeded);
+        accept(evc);
+        self.postMessage({type:'incumbent',stage:`已载入摆法起点（${seeded.length}/${data.seedLayout.length} 件），继续搜索优化`,best:serializeBest(),nodes,elapsed:Math.round(performance.now()-started),fullPackingFound:evc.complete,totalArea,totalItems});
+      }
+    }
+
     if(fullPackingAttempted){
       groups=fullCoreGroups; geometryMode=true;
       const stageDeadline=Math.min(hardDeadline,started+timeLimit*0.25);
@@ -4607,6 +4635,17 @@ function solveAndRender(){
     ...t,
     placements:t.placements.map(p=>({...p, mask:p.mask.toString()}))
   }));
+
+  // 求解起点（种子摆法）：把导入的 {no,cells} 映射为 prepared 物品的 itemIndex（按清单编号匹配，找不到的跳过）
+  let dataSeedLayout = null;
+  if(seedLayout && seedLayout.length){
+    dataSeedLayout = seedLayout.map(s=>{
+      const i = items.findIndex(t=>Number(t.no)===Number(s.no));
+      if(i<0) return null;
+      return {itemIndex:i, uid:items[i].uid, cells:s.cells.map(c=>[c[0],c[1]])};
+    }).filter(Boolean);
+    if(dataSeedLayout.length) document.getElementById('seedHint').textContent = `摆法起点：已生效（${dataSeedLayout.length}/${seedLayout.length} 件匹配到清单），求解将从它出发；坏起点不影响结果。`;
+  }
   solverWorkers=Array.from({length:workerCount},()=>createSolverWorker());
   solverWorker=solverWorkers[0];
   setSolverRunning(true);
@@ -4641,7 +4680,7 @@ ${skipped.length>0?'存在单件无法合法放置的物品，将直接搜索最
       inventory:inventory.map(x=>({...x,cells:cloneCells(x.cells)})),
       settings:{allowRotate:document.getElementById('allowRotate').checked,allowMirror:document.getElementById('allowMirror').checked,useAdjacencyBonus:useBonus,searchMode,parallelSearch:parallel,workerCount,optimizationOrder:['complete_loading','stat_totals_by_priority','manual_priority_neighbors','default_priority_neighbors','total_adjacency_count'],statPriority:statPriorityOrder,priorityTiers:SELF_PRIORITY_TIERS,manualPriorityRule:'1 is highest; blank uses default rules',assignmentStrategy:'geometry_then_item_assignment'},
       skipped:skipped.map(x=>({no:x.no,name:x.name,area:x.area,value:x.value})),manualItems,
-      solverMeta:{version:'v15',fullPackingAttempted:meta.fullPackingAttempted,fullPackingFound:meta.fullPackingFound,fullSearchCutoff:meta.fullSearchCutoff,optimizationCutoff:meta.optimizationCutoff,fallbackCutoff:meta.fallbackCutoff,totalArea:meta.totalArea,totalBase:meta.totalBase,totalItems:meta.totalItems,fullGroupCount:meta.fullGroupCount,detailedGroupCount:meta.detailedGroupCount,assignmentStrategy:meta.assignmentStrategy,singletonDeferredCount:meta.singletonDeferredCount,assignmentChecks:meta.assignmentChecks,crossShapePasses:meta.crossShapePasses||0,workerCount}
+      solverMeta:{version:'v16',fullPackingAttempted:meta.fullPackingAttempted,fullPackingFound:meta.fullPackingFound,fullSearchCutoff:meta.fullSearchCutoff,optimizationCutoff:meta.optimizationCutoff,fallbackCutoff:meta.fallbackCutoff,totalArea:meta.totalArea,totalBase:meta.totalBase,totalItems:meta.totalItems,fullGroupCount:meta.fullGroupCount,detailedGroupCount:meta.detailedGroupCount,assignmentStrategy:meta.assignmentStrategy,singletonDeferredCount:meta.singletonDeferredCount,assignmentChecks:meta.assignmentChecks,crossShapePasses:meta.crossShapePasses||0,workerCount}
     };
     solverWorkers=[]; solverWorker=null; stopSolverStatusHeartbeat(); setSolverRunning(false);
     renderResultGrid(best);
@@ -4689,7 +4728,8 @@ ${skipped.length>0?'存在单件无法合法放置的物品，将直接搜索最
     requiredTotalItems:inventory.length,
     requiredTotalArea:totalSearchArea,
     requiredTotalBase:totalSearchBase,
-    skippedCount:skipped.length
+    skippedCount:skipped.length,
+    ...(dataSeedLayout && dataSeedLayout.length ? {seedLayout:dataSeedLayout} : {})
   });
   });
 }
@@ -4899,6 +4939,30 @@ function loadConfig(){
   }catch(e){ alert('读取失败：配置数据损坏。'); }
 }
 
+function importSeedLayout(){
+  const input = document.getElementById('seedImportFile');
+  const file = input.files && input.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = e=>{
+    try{
+      const data = JSON.parse(e.target.result);
+      let placements = null;
+      if(Array.isArray(data.placements)) placements = data.placements;
+      else if(data.best && Array.isArray(data.best.placements)) placements = data.best.placements;
+      if(!placements || !placements.length){ alert('文件中没有摆法数据（需要 placements 字段，可导出手动摆盘工具的 JSON 或本页导出的结果 JSON）。'); return; }
+      const items = placements.map(p=>({
+        no: Number(p.no),
+        cells: (p.cells||[]).map(c=>[Number(c[0]),Number(c[1])]).filter(c=>Number.isFinite(c[0])&&Number.isFinite(c[1]))
+      })).filter(p=>p.cells.length>0);
+      if(!items.length){ alert('摆法数据无效（没有合法坐标）。'); return; }
+      seedLayout = items;
+      document.getElementById('seedHint').textContent = `摆法起点：已载入 ${seedLayout.length} 件（${file.name}），点“搜索更优摆放解”生效；重新导入或刷新页面可清除。`;
+    }catch(err){ alert('导入失败：文件内容无效'); }
+  };
+  reader.readAsText(file);
+  input.value = '';
+}
 function exportResult(){
   const data = lastResult || {message:'尚未计算结果', W, H, active, categoryDefs, currentCategory, inventory};
   const blob = new Blob([JSON.stringify(data, (k,v)=> typeof v === 'bigint' ? v.toString() : v, 2)], {type:'application/json;charset=utf-8'});
