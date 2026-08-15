@@ -889,6 +889,7 @@ function init(){
   updateTableColumnLayout();
   renderResultGrid(null);
   renderRecognitionPanel();
+  setInterval(()=>{ if(!document.hidden) autoPersistConfig(); }, 3000);
 }
 
 function getParallelWorkerLimit(){
@@ -4123,6 +4124,7 @@ function solverWorkerMain(){
       let restart=0;
       while(performance.now()<deadline && nodes<nodeCap){
         restart++;
+        const exploreRestart = restart % 8 === 0; // v15：每 8 次重启反贪心探索（前几层选较差分支）
         const rem=groups.map(g=>g.items.length);
         const lastIdx=groups.map(()=>-1);
         const placed=[];
@@ -4153,8 +4155,11 @@ function solverWorkerMain(){
           scored.sort((a,b)=>b.score-a.score || a.pi-b.pi);
           const oldLast=lastIdx[gi]; rem[gi]--;
           const branchLimit=Math.min(scored.length,Math.max(3,Math.ceil(7-depth*0.35)));
+          const explore = exploreRestart && depth < 3;
           for(let si=0;si<branchLimit;si++){
-            const x=scored[si]; lastIdx[gi]=x.pi; placed.push(x.p);
+            const xi = explore ? Math.max(0, scored.length-1-si) : si;
+            if(xi>=scored.length) break;
+            const x=scored[xi]; lastIdx[gi]=x.pi; placed.push(x.p);
             if(rec(occupied|x.p.mask,remArea-group.area,depth+1)){ placed.pop(); rem[gi]++; lastIdx[gi]=oldLast; return true; }
             placed.pop();
           }
@@ -4288,6 +4293,58 @@ function solverWorkerMain(){
       return current;
     }
 
+    // v15：扰动布局——随机移除 2-4 件（多格优先），在剩余空格中随机重放，返回新布局；放不下返回 null
+    function perturbLayout(layout){
+      const candidates = layout.map((p,i)=>({p,i}));
+      const multis = candidates.filter(x=>x.p.area>1);
+      const singles = candidates.filter(x=>x.p.area===1);
+      const k = 2 + Math.floor(rand()*3); // 2-4 件
+      const pick = [];
+      const pool = shuffled(multis.length?multis:singles).concat(shuffled(singles));
+      for(const x of pool){ if(pick.length>=k) break; pick.push(x); }
+      if(!pick.length) return null;
+      const removedSet = new Set(pick.map(x=>x.i));
+      const remaining = layout.filter((p,i)=>!removedSet.has(i));
+      let occupied = 0n;
+      for(const p of remaining) occupied |= p.mask;
+      const toPlace = shuffled(pick.map(x=>x.p));
+      for(const p of toPlace){
+        const it = items[p.itemIndex];
+        const feasible = it.placements.filter(t=>(t.mask & occupied)===0n);
+        if(!feasible.length) return null;
+        const t = feasible[Math.floor(rand()*feasible.length)];
+        remaining.push(instantiate(t, it, fullGroupByUid.get(String(it.uid)) || null));
+        occupied |= t.mask;
+      }
+      return remaining;
+    }
+    // v15：扰动重启迭代局部搜索（ILS）——跳出局部最优盆地
+    function ilsImprove(seed, deadline){
+      currentStage='阶段4：扰动重启（ILS）跳出局部最优';
+      let current = seed.slice();
+      let curEval = evaluateConcrete(current);
+      accept(curEval);
+      let iter = 0;
+      while(performance.now()<deadline && nodes<nodeLimit && iter<24){
+        iter++;
+        const perturbed = perturbLayout(current);
+        if(!perturbed) continue;
+        const multis = perturbed.filter(p=>p.area>1);
+        if(!multis.length) continue;
+        const improvedMultis = localImprove(multis, deadline);
+        const evc = completeGeometryWithSingletons(improvedMultis, true);
+        accept(evc);
+        const cs = crossShapeImprove(evc.placements, deadline, true);
+        const csEval = evaluateConcrete(cs);
+        accept(csEval);
+        if(compareEvaluationObjects(csEval, curEval)>0 || rand()<0.12){
+          current = cs; curEval = csEval;
+        }
+        reportProgress(false,{ilsIteration:iter});
+      }
+      return current;
+    }
+
     function searchBestPartial(deadline,nodeCap){
       currentStage='阶段2：按属性总值与邻接顺序搜索可行子集';
       const rem=groups.map(g=>g.items.length);
@@ -4370,14 +4427,19 @@ function solverWorkerMain(){
         fullSeed=localImprove(fullSeed,localDeadline);
         const multiDeadline=Math.min(hardDeadline,performance.now()+Math.max(500,Math.min(5000,timeLimit*0.22)));
         if(performance.now()<multiDeadline && nodes<nodeLimit) multiStartFullPackings(multiDeadline,Math.min(nodeLimit,nodes+Math.max(5000,Math.floor(nodeLimit*0.25))));
-        const crossReserve=Math.min(4500,Math.max(1200,timeLimit*0.18));
+        const crossReserve=Math.min(6000,Math.max(2000,timeLimit*0.25));
         const optimizeDeadline=Math.max(performance.now(),hardDeadline-crossReserve);
         if(performance.now()<optimizeDeadline && nodes<nodeLimit) optimizeFullPackings(optimizeDeadline,nodeLimit);
         if(best.complete && performance.now()<hardDeadline && nodes<nodeLimit){
           crossShapeImprove(best.placements,hardDeadline,true);
-          // v14：跨形状改动后回环——同形状局部优化 + 跨形状再一轮，让不同形状的联动重排有机会收敛
-          if(best.complete && performance.now()<hardDeadline && nodes<nodeLimit) localImprove(best.placements,hardDeadline);
+          // v14：跨形状改动后回环——同形状局部优化（只传多格）+ 跨形状再一轮，让不同形状的联动重排有机会收敛
+          if(best.complete && performance.now()<hardDeadline && nodes<nodeLimit){
+            const bestMultis = best.placements.filter(p=>p.area>1);
+            if(bestMultis.length) localImprove(bestMultis,hardDeadline);
+          }
           if(best.complete && performance.now()<hardDeadline && nodes<nodeLimit) crossShapeImprove(best.placements,hardDeadline,true);
+          // v15：扰动重启（ILS）跳出局部最优盆地
+          if(best.complete && performance.now()<hardDeadline && nodes<nodeLimit) ilsImprove(best.placements,hardDeadline);
         }
       }else if(performance.now()<hardDeadline && nodes<nodeLimit){
         groups=partialGroups; geometryMode=false;
@@ -4771,16 +4833,22 @@ function eventLine(e){
   return `+${formatNum(e.bonus)}`;
 }
 
-function saveConfig(){
-  const data = {
+function collectConfigData(){
+  return {
     W,H,active,categoryDefs,currentCategory,inventory,nextItemNo,
     allowRotate:document.getElementById('allowRotate').checked,
     allowMirror:document.getElementById('allowMirror').checked,
     useAdjacencyBonus:document.getElementById('useAdjacencyBonus').checked,
     statPriority:{attack:Number(document.getElementById('priorityAttack').value),defense:Number(document.getElementById('priorityDefense').value),hp:Number(document.getElementById('priorityHp').value)}
   };
-  localStorage.setItem('bagSolverConfig', JSON.stringify(data));
+}
+function saveConfig(){
+  localStorage.setItem('bagSolverConfig', JSON.stringify(collectConfigData()));
   alert('已保存到浏览器本地存储。');
+}
+function autoPersistConfig(){
+  // 静默自动保存（每 3 秒，仅前台标签页）：保证手动摆盘工具同步到的始终是最新数据
+  try{ localStorage.setItem('bagSolverConfig', JSON.stringify(collectConfigData())); }catch(e){}
 }
 function loadConfig(){
   const raw = localStorage.getItem('bagSolverConfig');
