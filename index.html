@@ -4318,7 +4318,7 @@ function solverWorkerMain(){
       }
       return remaining;
     }
-    // v15：扰动重启迭代局部搜索（ILS）——跳出局部最优盆地
+    // v15：扰动重启迭代局部搜索（ILS）——单链跳出局部最优（多起点多链实测无增益，已回滚）
     function ilsImprove(seed, deadline){
       currentStage='阶段4：扰动重启（ILS）跳出局部最优';
       let current = seed.slice();
